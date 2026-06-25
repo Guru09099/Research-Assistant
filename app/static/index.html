@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Autonomous Research Assistant</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Autonomous Research Assistant</h1>
+        <p>Ask a research question, upload PDFs, and manage memory.</p>
+      </header>
+
+      <section class="card">
+        <h2>Research Query</h2>
+        <textarea id="question" placeholder="Enter your research question..."></textarea>
+        <label><input type="checkbox" id="webSearch" checked /> Web search</label>
+        <label><input type="checkbox" id="pdfSearch" checked /> PDF search</label>
+        <label><input type="checkbox" id="memorySearch" checked /> Memory search</label>
+        <button id="runResearch">Run Research</button>
+      </section>
+
+      <section class="card">
+        <h2>Upload PDF</h2>
+        <input type="file" id="pdfUpload" accept="application/pdf" />
+        <button id="uploadPdf">Upload</button>
+        <div id="uploadResult"></div>
+      </section>
+
+      <section class="card">
+        <h2>Memory</h2>
+        <input id="memoryId" placeholder="Memory ID" />
+        <input id="memoryContent" placeholder="Memory content" />
+        <button id="addMemory">Add memory</button>
+        <button id="refreshMemory">Refresh memory list</button>
+        <div id="memoryList"></div>
+      </section>
+
+      <section class="card result-card">
+        <h2>Results</h2>
+        <div id="resultOutput">No results yet.</div>
+      </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
