@@ -1,16 +1,19 @@
 from typing import Any, Dict, List
 
 import openai
+from openai import OpenAI
 
 from .config import settings
 from .schemas import ToolResult
-from .tools import query_web, search_memory, search_pdf
+from .tools import build_langchain_tools, query_web, search_memory, search_pdf
 
 
 class ResearchAgent:
     def __init__(self, use_langchain: bool = False) -> None:
         self.use_langchain = use_langchain
         self._langchain_chain = None
+        self._langchain_executor = None
+        self._langchain_tools = []
         openai.api_key = settings.openai_api_key or settings.gemini_api_key
         self._initialize_langchain()
 
@@ -19,32 +22,62 @@ class ResearchAgent:
             return
 
         try:
-            from langchain_core.output_parsers import StrOutputParser
-            from langchain_core.prompts import ChatPromptTemplate
+            from langchain.agents import AgentExecutor, create_tool_calling_agent
+            from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
             from langchain_openai import ChatOpenAI
         except ImportError:
             self._langchain_chain = None
+            self._langchain_executor = None
+            self._langchain_tools = []
             return
 
-        if not settings.openai_api_key:
+        if not (settings.openai_api_key or settings.gemini_api_key):
             self._langchain_chain = None
+            self._langchain_executor = None
+            self._langchain_tools = []
             return
 
         llm = ChatOpenAI(
             model=settings.llm_model,
-            api_key=settings.openai_api_key,
-            temperature=0.3,
+            api_key=settings.openai_api_key or settings.gemini_api_key,
+            temperature=0.2,
         )
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    "You are an autonomous research assistant. Break tasks into research steps, choose tools, and summarize findings.",
+                    "You are an autonomous research assistant. Break tasks into "
+                    "research steps, use tools when helpful, and return a "
+                    "structured research report.",
                 ),
-                ("human", "{prompt}"),
+                ("human", "{input}"),
+                MessagesPlaceholder(variable_name="agent_scratchpad"),
             ]
         )
-        self._langchain_chain = prompt | llm | StrOutputParser()
+
+        tools = build_langchain_tools(
+            use_web_search=True,
+            use_pdf_search=True,
+            use_memory=True,
+            top_k=settings.max_search_results,
+        )
+        if not tools:
+            self._langchain_executor = None
+            self._langchain_tools = []
+            return
+
+        try:
+            agent = create_tool_calling_agent(llm, tools, prompt)
+            self._langchain_executor = AgentExecutor(
+                agent=agent,
+                tools=tools,
+                verbose=False,
+                handle_parsing_errors=True,
+            )
+            self._langchain_tools = tools
+        except Exception:
+            self._langchain_executor = None
+            self._langchain_tools = []
 
     def _llm_complete(self, prompt: str) -> str:
         if not settings.openai_api_key and not settings.gemini_api_key:
@@ -53,31 +86,65 @@ class ResearchAgent:
         if self._langchain_chain is not None:
             return self._langchain_chain.invoke({"prompt": prompt})
 
-        response = openai.ChatCompletion.create(
-            model=settings.llm_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an autonomous research assistant. Break tasks into "
-                        "research steps, choose tools, and summarize findings."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=800,
-            temperature=0.3,
-        )
-        return response.choices[0].message.content.strip()
+        api_key = settings.openai_api_key or settings.gemini_api_key
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY or GEMINI_API_KEY is required for the LLM agent.")
+
+        try:
+            client = OpenAI(api_key=api_key)
+            response = client.responses.create(
+                model=settings.llm_model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an autonomous research assistant. Break tasks into "
+                            "research steps, choose tools, and summarize findings."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_output_tokens=800,
+                temperature=0.3,
+            )
+            output_text = getattr(response, "output_text", None)
+            if output_text:
+                return output_text.strip()
+            if getattr(response, "output", None):
+                for item in response.output:
+                    if getattr(item, "type", None) == "message":
+                        parts = []
+                        for content in getattr(item, "content", []) or []:
+                            if getattr(content, "text", None):
+                                parts.append(content.text)
+                        if parts:
+                            return "\n".join(parts).strip()
+        except Exception:
+            raise RuntimeError("Unable to reach the configured LLM backend.")
+
+        return ""
 
     def _decompose(self, query: str) -> List[str]:
+        if self._langchain_executor is not None:
+            return [query]
+
         prompt = (
             "Decompose the research goal into a concise plan of 3-5 subquestions or steps.\n\n"
             f"Research goal: {query}\n\n"
             "Return each step as a numbered item."
         )
-        result = self._llm_complete(prompt)
-        steps = [line.strip(" .") for line in result.splitlines() if line.strip()]
+        try:
+            result = self._llm_complete(prompt)
+        except RuntimeError:
+            return [query]
+        steps = []
+        for line in result.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("1.", "2.", "3.", "4.", "5.")):
+                stripped = stripped.split(".", 1)[1].strip()
+            steps.append(stripped.strip(" ."))
         return steps[:5] if steps else [query]
 
     def _select_tools(
@@ -98,12 +165,12 @@ class ResearchAgent:
 
     def _collect_tool_results(self, step: str, tools: List[str]) -> List[ToolResult]:
         results: List[ToolResult] = []
-        for tool in tools:
-            if tool == "web":
+        for tool_name in tools:
+            if tool_name == "web":
                 result = query_web(step, top_k=settings.max_search_results)
-            elif tool == "pdf":
+            elif tool_name == "pdf":
                 result = search_pdf(step, top_k=settings.max_search_results)
-            elif tool == "memory":
+            elif tool_name == "memory":
                 result = search_memory(step)
             else:
                 continue
@@ -134,6 +201,29 @@ class ResearchAgent:
         ).format(question=question, plan_text=plan_text, summary_text=summary_text)
         return self._llm_complete(prompt)
 
+    def _run_with_langchain(self, query: str, plan: List[str], results: List[ToolResult]) -> str:
+        if self._langchain_executor is None:
+            return self._reflect(query, plan, results)
+
+        try:
+            evidence = []
+            for result in results:
+                evidence.append(
+                    f"Source: {result.source}\nSummary: {result.summary}\nDetails: {result.details}"
+                )
+            payload = {
+                "input": (
+                    f"Research question: {query}\n\n"
+                    f"Suggested plan:\n{'\n'.join(f'- {step}' for step in plan)}\n\n"
+                    "Collected evidence:\n"
+                    f"{'\n\n'.join(evidence) if evidence else 'No tool evidence available.'}"
+                )
+            }
+            langchain_result = self._langchain_executor.invoke(payload)
+            return str(langchain_result.get("output", langchain_result.get("result", "")))
+        except Exception:
+            return self._reflect(query, plan, results)
+
     def run(
         self,
         query: str,
@@ -146,7 +236,7 @@ class ResearchAgent:
         for step in plan:
             tools = self._select_tools(step, use_web_search, use_pdf_search, use_memory)
             results.extend(self._collect_tool_results(step, tools))
-        final_report = self._reflect(query, plan, results)
+        final_report = self._run_with_langchain(query, plan, results)
         return {
             "question": query,
             "plan": plan,

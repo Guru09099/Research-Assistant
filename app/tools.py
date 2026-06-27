@@ -8,6 +8,11 @@ from PyPDF2 import PdfReader
 from .config import settings
 from .vector_store import vector_store
 
+try:
+    from langchain_core.tools import tool
+except ImportError:  # pragma: no cover - optional dependency guard
+    tool = None
+
 
 def query_web(query: str, top_k: int = 5) -> dict:
     if not settings.serpapi_api_key:
@@ -113,3 +118,41 @@ def search_memory(query: str) -> dict:
         "summary": f"Retrieved {len(memories)} memory items matching the query.",
         "details": details,
     }
+
+
+def build_langchain_tools(
+    use_web_search: bool = True,
+    use_pdf_search: bool = True,
+    use_memory: bool = True,
+    top_k: int = 5,
+):
+    if tool is None:
+        return []
+
+    tools = []
+
+    if use_web_search:
+        @tool
+        def web_search_tool(query: str) -> dict:
+            """Search the web for fresh information relevant to the user's question."""
+            return query_web(query, top_k=top_k)
+
+        tools.append(web_search_tool)
+
+    if use_pdf_search:
+        @tool
+        def pdf_search_tool(query: str) -> dict:
+            """Search uploaded PDF documents for passages that match the user's question."""
+            return search_pdf(query, top_k=top_k)
+
+        tools.append(pdf_search_tool)
+
+    if use_memory:
+        @tool
+        def memory_search_tool(query: str) -> dict:
+            """Search the assistant's persistent memory for prior knowledge or preferences."""
+            return search_memory(query)
+
+        tools.append(memory_search_tool)
+
+    return tools
