@@ -1,18 +1,21 @@
 from pathlib import Path
-from typing import List
-
-from fastapi import FastAPI, File, UploadFile
+from typing import Any, List, Optional
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-from .agent import ResearchAgent
-from .config import settings
-from .memory import memory_store
-from .schemas import AgentResponse, MemoryItem, QueryRequest, UploadResponse
-from .tools import analyze_pdf, ingest_pdf_to_vector_store
+from database import get_research_history, init_db, save_research
+from research_assistant.graph import research_graph
 
-app = FastAPI(title=settings.app_name)
+app = FastAPI(
+    title="Beginner-Friendly Autonomous Research Assistant",
+    description="A clean, understandable AI research assistant built with LangGraph, FastAPI, and SQLite.",
+    version="1.0.0",
+)
+
+# Enable CORS for easy local exploration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,55 +23,139 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount static files if present
 static_dir = Path(__file__).resolve().parent / "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-agent = ResearchAgent(use_langchain=settings.use_langchain)
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
 @app.on_event("startup")
-def startup_event() -> None:
-    Path(settings.pdf_storage_dir).mkdir(parents=True, exist_ok=True)
+def on_startup() -> None:
+    """Initialize the SQLite database on application startup."""
+    init_db()
 
 
-@app.get("/", response_class=FileResponse)
-def home() -> FileResponse:
-    return FileResponse(static_dir / "index.html")
-
-
-@app.get("/api/health")
-def health() -> JSONResponse:
-    return JSONResponse({"status": "ok", "application": settings.app_name})
-
-
-@app.post("/api/research", response_model=AgentResponse)
-def research(request: QueryRequest) -> AgentResponse:
-    result = agent.run(
-        query=request.question,
-        use_web_search=request.use_web_search,
-        use_pdf_search=request.use_pdf_search,
-        use_memory=request.use_memory,
+# ---------------------------------------------------------------------------
+# Request and Response Models (Pydantic)
+# ---------------------------------------------------------------------------
+class ResearchRequest(BaseModel):
+    question: str = Field(
+        ...,
+        min_length=1,
+        description="The research question to investigate.",
+        example="What are the practical applications of AI agents?",
     )
-    return AgentResponse(**result)
 
 
-@app.post("/api/upload-pdf", response_model=UploadResponse)
-def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
-    filename = Path(file.filename).name
-    safe_path = Path(settings.pdf_storage_dir) / filename
-    with open(safe_path, "wb") as buffer:
-        buffer.write(file.file.read())
-    pages = analyze_pdf(str(safe_path))
-    ingest_pdf_to_vector_store(str(safe_path), file_name=filename)
-    return UploadResponse(filename=filename, pages=pages, status="uploaded")
+class ResearchResponse(BaseModel):
+    question: str
+    search_queries: List[str]
+    final_report: str
 
 
-@app.get("/api/memory", response_model=List[MemoryItem])
-def read_memory() -> List[MemoryItem]:
-    return memory_store.list()
+class HistoryItem(BaseModel):
+    id: int
+    question: str
+    search_queries: List[str]
+    final_report: str
+    created_at: str
 
 
-@app.post("/api/memory", response_model=MemoryItem)
-def add_memory(item: MemoryItem) -> MemoryItem:
-    memory_store.add(item)
-    return item
+class HistoryResponse(BaseModel):
+    history: List[HistoryItem]
+
+
+# ---------------------------------------------------------------------------
+# Core Endpoints
+# ---------------------------------------------------------------------------
+@app.get("/", response_class=FileResponse, include_in_schema=False)
+def home():
+    """Serve the static frontend if available, or return health."""
+    index_file = static_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return JSONResponse({"status": "ok", "message": "Autonomous Research Assistant API is running."})
+
+
+@app.get("/health", tags=["Health"])
+def health():
+    """Health check endpoint to verify that the service is running."""
+    return {"status": "ok"}
+
+
+@app.post(
+    "/research",
+    response_model=ResearchResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["Research"],
+)
+def run_research(request: ResearchRequest):
+    """Accepts a research question, executes the 3-node LangGraph workflow,
+
+    saves the result to SQLite, and returns the generated report and queries.
+    """
+    clean_question = request.question.strip()
+    if not clean_question:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Research question cannot be empty or blank.",
+        )
+
+    try:
+        # 1. Execute the LangGraph workflow
+        # graph.invoke() starts execution at START and flows through all nodes to END
+        result = research_graph.invoke({"question": clean_question})
+
+        # 2. Extract outputs from the final graph state
+        final_report = result.get("final_report", "")
+        search_queries = result.get("search_queries", [])
+
+        # 3. Persist successful research execution to SQLite
+        save_research(
+            question=clean_question,
+            search_queries=search_queries,
+            final_report=final_report,
+        )
+
+        return ResearchResponse(
+            question=clean_question,
+            search_queries=search_queries,
+            final_report=final_report,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while running the research workflow: {str(e)}",
+        )
+
+
+@app.get(
+    "/research/history",
+    response_model=HistoryResponse,
+    tags=["Research"],
+)
+def list_history(
+    limit: int = Query(default=10, ge=1, le=100, description="Max number of recent records to return"),
+):
+    """Returns the most recent research reports saved in SQLite."""
+    records = get_research_history(limit=limit)
+    return HistoryResponse(history=[HistoryItem(**rec) for rec in records])
+
+
+# ---------------------------------------------------------------------------
+# Backward Compatibility Endpoints for existing frontend
+# ---------------------------------------------------------------------------
+@app.get("/api/health", include_in_schema=False)
+def api_health():
+    return {"status": "ok"}
+
+
+@app.post("/api/research", include_in_schema=False)
+def api_research(request: ResearchRequest):
+    result = run_research(request)
+    return {
+        "question": result.question,
+        "plan": result.search_queries,
+        "results": [{"source": "web", "summary": q, "details": ""} for q in result.search_queries],
+        "final_report": result.final_report,
+    }

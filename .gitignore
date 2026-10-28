@@ -5,6 +5,8 @@ __pycache__/
 venv/
 data/*.json
 data/pdfs/
+*.db
+.pytest_cache/
 .DS_Store
 .idea/
 .vscode/
